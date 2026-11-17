@@ -4,6 +4,7 @@
 #include <iomanip>
 #include <fstream>
 #include "fluid.h"
+#include "fluid.cpp"
 
 #include <map>
 #include <string>
@@ -15,20 +16,63 @@
 #include <chrono>
 #include <cassert>
 
-void launch_advect_kernel(int blocks, int threads, std::vector<FluidCell*> leaves, int step, bool& minSizeSmall, long double& thisMaxDensity, long double& maxDensity, long double& totMass) {
-	if (step == 1) {
-		advect_kernel<<<blocks, threads>>>(leaves, minSizeSmall, thisMaxDensity, maxDensity);
-	} else if (step == 2) {
-		advect_kernel2<<<blocks, threads>>>(leaves);
-	} else if (step == 3) {
-		advect_kernel3<<<blocks, threads>>>(leaves, minSizeSmall, thisMaxDensity, maxDensity);
-	} else if (step == 4) {
-		advect_kernel4<<<blocks, threads>>>(leaves, totMass);
+long double getFlux2(FluidCell *cell, long double dist, long double boundary, std::function<long double(FluidCell *)> func, Direction dir, long double totFlux, bool forceFarOff=true, bool farCell=false, std::function<void (FluidCell *, long double)> func2=[](FluidCell *c, long double m){c->newMass -= m;}) {
+	if (!std::isfinite(dist)) return 0;
+	long double flux = 0;
+	long double leng = (dir == LEFT) || (dir == RIGHT) ? cell->getWidth() : cell->getHeight();
+	if (cell->hasChildren()) {
+		switch (dir) {
+			case RIGHT:
+				flux = getFlux2(cell->nw, dist, boundary, func, dir, totFlux) + getFlux2(cell->sw, dist, boundary, func, dir, totFlux, forceFarOff, farCell, func2);
+				// return getFlux2(cell->nw, dist, boundary, func, dir, totFlux) + getFlux2(cell->sw, dist, boundary, func, dir, totFlux);
+				break;
+			case LEFT:
+				flux = getFlux2(cell->ne, dist, boundary, func, dir, totFlux) + getFlux2(cell->se, dist, boundary, func, dir, totFlux, forceFarOff, farCell, func2);
+				// return getFlux2(cell->ne, dist, boundary, func, dir, totFlux) + getFlux2(cell->se, dist, boundary, func, dir, totFlux);
+				break;
+			case UP:
+				flux = getFlux2(cell->se, dist, boundary, func, dir, totFlux) + getFlux2(cell->sw, dist, boundary, func, dir, totFlux, forceFarOff, farCell, func2);
+				// return getFlux2(cell->se, dist, boundary, func, dir, totFlux) + getFlux2(cell->sw, dist, boundary, func, dir, totFlux);
+				break;
+			case DOWN:
+				flux = getFlux2(cell->ne, dist, boundary, func, dir, totFlux) + getFlux2(cell->nw, dist, boundary, func, dir, totFlux, forceFarOff, farCell, func2);
+				// return getFlux2(cell->ne, dist, boundary, func, dir, totFlux) + getFlux2(cell->nw, dist, boundary, func, dir, totFlux);
+		}
+	} else if (dist <= leng) {
+		flux = totFlux + func(cell)*boundary*dist/cell->getSize();
+		// return totFlux + func(cell)*boundary*dist/cell->getSize();
+	} else {
+		FluidCell *nextCell;
+		switch (dir) {
+			case RIGHT:
+				nextCell = cell->getRight();
+				break;
+			case LEFT:
+				nextCell = cell->getLeft();
+				break;
+			case UP:
+				nextCell = cell->getTop();
+				break;
+			case DOWN:
+				nextCell = cell->getBottom();
+		}
+		if (nextCell != cell) {
+			flux = getFlux2(nextCell, dist-leng, boundary, func, dir, totFlux + func(cell)*boundary*leng/cell->getSize(), forceFarOff, true, func2);
+			// return getFlux2(nextCell, dist-leng, boundary, func, dir, totFlux + func(cell)*boundary*leng/cell->getSize(), true);
+		} else {
+			flux = totFlux + func(cell)*boundary*leng/cell->getSize();
+			// return totFlux + func(cell)*boundary*leng/cell->getSize();
+		}
 	}
-	cudaDeviceSynchronize();
+	if (!forceFarOff && farCell) {
+		// std::cout << "far out dude\n";
+		func2(cell,flux-totFlux);
+	}
+
+	return flux;
 }
 
-__global__ void advect_kernel(std::vector<FluidCell*> leaves, bool& minSizeSmall, long double& thisMaxDensity, long double& maxDensity) {
+__global__ void advect_kernel(std::vector<FluidCell*> leaves, bool& minSizeSmall, double minSize, float maxFracTraveled, long double& thisMaxDensity, long double& maxDensity, double& maxV, float dt) {
 	int workIdx = threadIdx.x + blockIdx.x * blockDim.x;
 	
 	if (workIdx < leaves.size()) {
@@ -45,7 +89,7 @@ __global__ void advect_kernel(std::vector<FluidCell*> leaves, bool& minSizeSmall
 		if (cell->getDensity() > 1e-2*maxDensity && std::max(abs(vC.getVx()),abs(vC.getVy())) > maxV) {
 			maxV = std::max(abs(vC.getVx()),abs(vC.getVy()));
 		}
-		float fracTraveled = std::max(abs(vC.getVx()),abs(vC.getVy()))*getdt()/std::sqrt(cell->getSize());
+		float fracTraveled = std::max(abs(vC.getVx()),abs(vC.getVy()))*dt/std::sqrt(cell->getSize());
 		if (fracTraveled > maxFracTraveled) {
 			if (fracTraveled > 1) {
 				// std::cout << "maxFrac: " << fracTraveled << " " << (cell->getMass()-cellR->getMass())/(2*cell->getWidth()) << std::endl;
@@ -139,17 +183,17 @@ __global__ void advect_kernel(std::vector<FluidCell*> leaves, bool& minSizeSmall
 					if (vxR < 0) {
 						dir = RIGHT;
 						nextCell = children[i];
-						dist = std::abs(vxR*getdt());
+						dist = std::abs(vxR*dt);
 					} else {
 						dir = LEFT;
 						nextCell = cell;
-						dist = std::min(std::abs(vxR*getdt()),cell->getWidth());
+						dist = std::min(std::abs(vxR*dt),cell->getWidth());
 					}
 					face = children[i]->getHeight();
 					
 					massFluxR += getFlux2(nextCell, dist, face, [](FluidCell *c) {return c->getMass();}, dir, 0, false, false);
 					EFluxR += getFlux2(nextCell, dist, face, [](FluidCell *c) {return c->getE(false)*c->getSize();}, dir, 0, false, false, [](FluidCell *c, long double m){c->newE -= m/c->getSize();});
-					// vxFluxR += getFlux(nextCell, std::abs(vxR*getdt()), children[i]->getHeight(), MOMENTUM, dir, 0);
+					// vxFluxR += getFlux(nextCell, std::abs(vxR*dt), children[i]->getHeight(), MOMENTUM, dir, 0);
 					vxFluxR += getFlux2(nextCell, dist, face, [](FluidCell *c) {return c->getMass()*c->getVelocity().getVx();}, dir, 0);
 					vyFluxR += getFlux2(nextCell, dist, face, [](FluidCell *c) {return c->getMass()*c->getVelocity().getVy();}, dir, 0);
 					XFluxR += getFlux2(nextCell, dist, face, [](FluidCell *c) {return c->getX()*c->getMass();}, dir, 0);
@@ -164,17 +208,17 @@ __global__ void advect_kernel(std::vector<FluidCell*> leaves, bool& minSizeSmall
 				if (vxR < 0) {
 					dir = RIGHT;
 					nextCell = cellR;
-					dist = std::abs(vxR*getdt());
+					dist = std::abs(vxR*dt);
 				} else {
 					dir = LEFT;
 					nextCell = cell;
-					dist = std::min(std::abs(vxR*getdt()),cell->getWidth());
+					dist = std::min(std::abs(vxR*dt),cell->getWidth());
 				}
 				face = cell->getHeight();
 
 				massFluxR = getFlux2(nextCell, dist, face, [](FluidCell *c) {return c->getMass();}, dir, 0, false, false);
 				EFluxR = getFlux2(nextCell, dist, face, [](FluidCell *c) {return c->getE(false)*c->getSize();}, dir, 0, false, false, [](FluidCell *c, long double m){c->newE -= m/c->getSize();});
-				// vxFluxR = getFlux(nextCell, std::abs(vxR*getdt()), cell->getHeight(), MOMENTUM, dir, 0);
+				// vxFluxR = getFlux(nextCell, std::abs(vxR*dt), cell->getHeight(), MOMENTUM, dir, 0);
 				vxFluxR = getFlux2(nextCell, dist, face, [](FluidCell *c) {return c->getMass()*c->getVelocity().getVx();}, dir, 0);
 				vyFluxR = getFlux2(nextCell, dist, face, [](FluidCell *c) {return c->getMass()*c->getVelocity().getVy();}, dir, 0);
 				XFluxR = getFlux2(nextCell, dist, face, [](FluidCell *c) {return c->getX()*c->getMass();}, dir, 0);
@@ -207,17 +251,17 @@ __global__ void advect_kernel(std::vector<FluidCell*> leaves, bool& minSizeSmall
 					if (vxL < 0) {
 						dir = RIGHT;
 						nextCell = cell;
-						dist = std::min(std::abs(vxL*getdt()),cell->getWidth());
+						dist = std::min(std::abs(vxL*dt),cell->getWidth());
 					} else {
 						dir = LEFT;
 						nextCell = children[i];
-						dist = std::abs(vxL*getdt());
+						dist = std::abs(vxL*dt);
 					}
 					face = children[i]->getHeight();
 
 					massFluxL += getFlux2(nextCell, dist, face, [](FluidCell *c) {return c->getMass();}, dir, 0, false, false);
 					EFluxL += getFlux2(nextCell, dist, face, [](FluidCell *c) {return c->getE(false)*c->getSize();}, dir, 0, false, false, [](FluidCell *c, long double m){c->newE -= m/c->getSize();});
-					// vxFluxL += getFlux(nextCell, std::abs(vxL*getdt()), children[i]->getHeight(), MOMENTUM, dir, 0);
+					// vxFluxL += getFlux(nextCell, std::abs(vxL*dt), children[i]->getHeight(), MOMENTUM, dir, 0);
 					vxFluxL += getFlux2(nextCell, dist, face, [](FluidCell *c) {return c->getMass()*c->getVelocity().getVx();}, dir, 0);
 					vyFluxL += getFlux2(nextCell, dist, face, [](FluidCell *c) {return c->getMass()*c->getVelocity().getVy();}, dir, 0);
 					XFluxL += getFlux2(nextCell, dist, face, [](FluidCell *c) {return c->getX()*c->getMass();}, dir, 0);
@@ -231,17 +275,17 @@ __global__ void advect_kernel(std::vector<FluidCell*> leaves, bool& minSizeSmall
 				if (vxL < 0) {
 					dir = RIGHT;
 					nextCell = cell;
-					dist = std::min(std::abs(vxL*getdt()),cell->getWidth());
+					dist = std::min(std::abs(vxL*dt),cell->getWidth());
 				} else {
 					dir = LEFT;
 					nextCell = cellL;
-					dist = std::abs(vxL*getdt());
+					dist = std::abs(vxL*dt);
 				}
 				face = cell->getHeight();
 
 				massFluxL = getFlux2(nextCell, dist, face, [](FluidCell *c) {return c->getMass();}, dir, 0, false, false);
 				EFluxL = getFlux2(nextCell, dist, face, [](FluidCell *c) {return c->getE(false)*c->getSize();}, dir, 0, false, false, [](FluidCell *c, long double m){c->newE -= m/c->getSize();});
-				// vxFluxL = getFlux(nextCell, std::abs(vxL*getdt()), cell->getHeight(), MOMENTUM, dir, 0);
+				// vxFluxL = getFlux(nextCell, std::abs(vxL*dt), cell->getHeight(), MOMENTUM, dir, 0);
 				vxFluxL = getFlux2(nextCell, dist, face, [](FluidCell *c) {return c->getMass()*c->getVelocity().getVx();}, dir, 0);
 				vyFluxL = getFlux2(nextCell, dist, face, [](FluidCell *c) {return c->getMass()*c->getVelocity().getVy();}, dir, 0);
 				XFluxL = getFlux2(nextCell, dist, face, [](FluidCell *c) {return c->getX()*c->getMass();}, dir, 0);
@@ -272,11 +316,11 @@ __global__ void advect_kernel(std::vector<FluidCell*> leaves, bool& minSizeSmall
 					if (vyT < 0) {
 						dir = UP;
 						nextCell = children[i];
-						dist = std::abs(vyT*getdt());
+						dist = std::abs(vyT*dt);
 					} else {
 						dir = DOWN;
 						nextCell = cell;
-						dist = std::min(std::abs(vyT*getdt()),cell->getHeight());
+						dist = std::min(std::abs(vyT*dt),cell->getHeight());
 					}
 
 					face = children[i]->getWidth();
@@ -296,11 +340,11 @@ __global__ void advect_kernel(std::vector<FluidCell*> leaves, bool& minSizeSmall
 				if (vyT < 0) {
 					dir = UP;
 					nextCell = cellT;
-					dist = std::abs(vyT*getdt());
+					dist = std::abs(vyT*dt);
 				} else {
 					dir = DOWN;
 					nextCell = cell;
-					dist = std::min(std::abs(vyT*getdt()),cell->getHeight());
+					dist = std::min(std::abs(vyT*dt),cell->getHeight());
 				}
 
 				face = cell->getWidth();
@@ -337,11 +381,11 @@ __global__ void advect_kernel(std::vector<FluidCell*> leaves, bool& minSizeSmall
 					if (vyB < 0) {
 						dir = UP;
 						nextCell = cell;
-						dist = std::min(std::abs(vyB*getdt()),cell->getHeight());
+						dist = std::min(std::abs(vyB*dt),cell->getHeight());
 					} else {
 						dir = DOWN;
 						nextCell = children[i];
-						dist = std::abs(vyB*getdt());
+						dist = std::abs(vyB*dt);
 					}
 
 					face = children[i]->getWidth();
@@ -361,11 +405,11 @@ __global__ void advect_kernel(std::vector<FluidCell*> leaves, bool& minSizeSmall
 				if (vyB < 0) {
 					dir = UP;
 					nextCell = cell;
-					dist = std::min(std::abs(vyB*getdt()),cell->getHeight());
+					dist = std::min(std::abs(vyB*dt),cell->getHeight());
 				} else {
 					dir = DOWN;
 					nextCell = cellB;
-					dist = std::abs(vyB*getdt());
+					dist = std::abs(vyB*dt);
 				}
 
 				face = cell->getWidth();
@@ -507,7 +551,7 @@ __global__ void advect_kernel2(std::vector<FluidCell*> leaves) {
 	}
 }
 
-__global__ void advect_kernel3(std::vector<FluidCell*> leaves, bool& minSizeSmall, long double& thisMaxDensity, long double& maxDensity) {
+__global__ void advect_kernel3(std::vector<FluidCell*> leaves, bool& minSizeSmall, double minSize, long double& thisMaxDensity, long double& maxDensity, float dt) {
 	int workIdx = threadIdx.x + blockIdx.x * blockDim.x;
 	
 	if (workIdx < leaves.size()) {
@@ -593,11 +637,11 @@ __global__ void advect_kernel3(std::vector<FluidCell*> leaves, bool& minSizeSmal
 					if (vxR < 0) {
 						dir = RIGHT;
 						nextCell = children[i];
-						dist = std::abs(vxR*getdt());
+						dist = std::abs(vxR*dt);
 					} else {
 						dir = LEFT;
 						nextCell = cell;
-						dist = std::min(std::abs(vxR*getdt()),cell->getWidth());
+						dist = std::min(std::abs(vxR*dt),cell->getWidth());
 					}
 
 					face = children[i]->getHeight();
@@ -614,11 +658,11 @@ __global__ void advect_kernel3(std::vector<FluidCell*> leaves, bool& minSizeSmal
 				if (vxR < 0) {
 					dir = RIGHT;
 					nextCell = cellR;
-					dist = std::abs(vxR*getdt());
+					dist = std::abs(vxR*dt);
 				} else {
 					dir = LEFT;
 					nextCell = cell;
-					dist = std::min(std::abs(vxR*getdt()),cell->getWidth());
+					dist = std::min(std::abs(vxR*dt),cell->getWidth());
 				}
 
 				face = cell->getHeight();
@@ -653,11 +697,11 @@ __global__ void advect_kernel3(std::vector<FluidCell*> leaves, bool& minSizeSmal
 					if (vxL < 0) {
 						dir = RIGHT;
 						nextCell = cell;
-						dist = std::min(std::abs(vxL*getdt()),cell->getWidth());
+						dist = std::min(std::abs(vxL*dt),cell->getWidth());
 					} else {
 						dir = LEFT;
 						nextCell = children[i];
-						dist = std::abs(vxL*getdt());
+						dist = std::abs(vxL*dt);
 					}
 
 					face = children[i]->getHeight();
@@ -675,11 +719,11 @@ __global__ void advect_kernel3(std::vector<FluidCell*> leaves, bool& minSizeSmal
 				if (vxL < 0) {
 					dir = RIGHT;
 					nextCell = cell;
-					dist = std::min(std::abs(vxL*getdt()),cell->getWidth());
+					dist = std::min(std::abs(vxL*dt),cell->getWidth());
 				} else {
 					dir = LEFT;
 					nextCell = cellL;
-					dist = std::abs(vxL*getdt());
+					dist = std::abs(vxL*dt);
 				}
 
 				face = cell->getHeight();
@@ -713,11 +757,11 @@ __global__ void advect_kernel3(std::vector<FluidCell*> leaves, bool& minSizeSmal
 					if (vyT < 0) {
 						dir = UP;
 						nextCell = children[i];
-						dist = std::abs(vyT*getdt());
+						dist = std::abs(vyT*dt);
 					} else {
 						dir = DOWN;
 						nextCell = cell;
-						dist = std::min(std::abs(vyT*getdt()),cell->getHeight());
+						dist = std::min(std::abs(vyT*dt),cell->getHeight());
 					}
 
 					face = children[i]->getWidth();
@@ -736,11 +780,11 @@ __global__ void advect_kernel3(std::vector<FluidCell*> leaves, bool& minSizeSmal
 				if (vyT < 0) {
 					dir = UP;
 					nextCell = cellT;
-					dist = std::abs(vyT*getdt());
+					dist = std::abs(vyT*dt);
 				} else {
 					dir = DOWN;
 					nextCell = cell;
-					dist = std::min(std::abs(vyT*getdt()),cell->getHeight());
+					dist = std::min(std::abs(vyT*dt),cell->getHeight());
 				}
 
 				face = cell->getWidth();
@@ -774,11 +818,11 @@ __global__ void advect_kernel3(std::vector<FluidCell*> leaves, bool& minSizeSmal
 					if (vyB < 0) {
 						dir = UP;
 						nextCell = cell;
-						dist = std::min(std::abs(vyB*getdt()),cell->getHeight());
+						dist = std::min(std::abs(vyB*dt),cell->getHeight());
 					} else {
 						dir = DOWN;
 						nextCell = children[i];
-						dist = std::abs(vyB*getdt());
+						dist = std::abs(vyB*dt);
 					}
 					face = children[i]->getWidth();
 					massFluxB += getFlux2(nextCell, dist, face, [](FluidCell *c){return c->newMassx*c->massODs;}, dir, 0, false, false, [](FluidCell *c, long double m){c->newMass -= m;});
@@ -797,11 +841,11 @@ __global__ void advect_kernel3(std::vector<FluidCell*> leaves, bool& minSizeSmal
 				if (vyB < 0) {
 					dir = UP;
 					nextCell = cell;
-					dist = std::min(std::abs(vyB*getdt()),cell->getHeight());
+					dist = std::min(std::abs(vyB*dt),cell->getHeight());
 				} else {
 					dir = DOWN;
 					nextCell = cellB;
-					dist = std::abs(vyB*getdt());
+					dist = std::abs(vyB*dt);
 				}
 				face = cell->getWidth();
 				massFluxB = getFlux2(nextCell, dist, face, [](FluidCell *c){return c->newMassx*c->massODs;}, dir, 0, false, false, [](FluidCell *c, long double m){c->newMass -= m;});
@@ -929,431 +973,16 @@ __global__ void advect_kernel4(std::vector<FluidCell*> leaves, long double& totM
 	}
 }
 
-long double getFlux2(FluidCell *cell, long double dist, long double boundary, std::function<long double(FluidCell *)> func, Direction dir, long double totFlux, bool forceFarOff=true, bool farCell=false, std::function<void (FluidCell *, long double)> func2=[](FluidCell *c, long double m){c->newMass -= m;}) {
-	if (!std::isfinite(dist)) return 0;
-	long double flux = 0;
-	long double leng = (dir == LEFT) || (dir == RIGHT) ? cell->getWidth() : cell->getHeight();
-	if (cell->hasChildren()) {
-		switch (dir) {
-			case RIGHT:
-				flux = getFlux2(cell->nw, dist, boundary, func, dir, totFlux) + getFlux2(cell->sw, dist, boundary, func, dir, totFlux, forceFarOff, farCell, func2);
-				// return getFlux2(cell->nw, dist, boundary, func, dir, totFlux) + getFlux2(cell->sw, dist, boundary, func, dir, totFlux);
-				break;
-			case LEFT:
-				flux = getFlux2(cell->ne, dist, boundary, func, dir, totFlux) + getFlux2(cell->se, dist, boundary, func, dir, totFlux, forceFarOff, farCell, func2);
-				// return getFlux2(cell->ne, dist, boundary, func, dir, totFlux) + getFlux2(cell->se, dist, boundary, func, dir, totFlux);
-				break;
-			case UP:
-				flux = getFlux2(cell->se, dist, boundary, func, dir, totFlux) + getFlux2(cell->sw, dist, boundary, func, dir, totFlux, forceFarOff, farCell, func2);
-				// return getFlux2(cell->se, dist, boundary, func, dir, totFlux) + getFlux2(cell->sw, dist, boundary, func, dir, totFlux);
-				break;
-			case DOWN:
-				flux = getFlux2(cell->ne, dist, boundary, func, dir, totFlux) + getFlux2(cell->nw, dist, boundary, func, dir, totFlux, forceFarOff, farCell, func2);
-				// return getFlux2(cell->ne, dist, boundary, func, dir, totFlux) + getFlux2(cell->nw, dist, boundary, func, dir, totFlux);
-		}
-	} else if (dist <= leng) {
-		flux = totFlux + func(cell)*boundary*dist/cell->getSize();
-		// return totFlux + func(cell)*boundary*dist/cell->getSize();
-	} else {
-		FluidCell *nextCell;
-		switch (dir) {
-			case RIGHT:
-				nextCell = cell->getRight();
-				break;
-			case LEFT:
-				nextCell = cell->getLeft();
-				break;
-			case UP:
-				nextCell = cell->getTop();
-				break;
-			case DOWN:
-				nextCell = cell->getBottom();
-		}
-		if (nextCell != cell) {
-			flux = getFlux2(nextCell, dist-leng, boundary, func, dir, totFlux + func(cell)*boundary*leng/cell->getSize(), forceFarOff, true, func2);
-			// return getFlux2(nextCell, dist-leng, boundary, func, dir, totFlux + func(cell)*boundary*leng/cell->getSize(), true);
-		} else {
-			flux = totFlux + func(cell)*boundary*leng/cell->getSize();
-			// return totFlux + func(cell)*boundary*leng/cell->getSize();
-		}
+void launch_advect_kernel(int blocks, int threads, std::vector<FluidCell*> leaves, int step, bool& minSizeSmall, double minSize, float maxFracTraveled, long double& thisMaxDensity, long double& maxDensity, long double& totMass, double& maxV, float dt) {
+	if (step == 1) {
+		advect_kernel<<<blocks, threads>>>(leaves, minSizeSmall, minSize, maxFracTraveled, thisMaxDensity, maxDensity, maxV, dt);
+	} else if (step == 2) {
+		advect_kernel2<<<blocks, threads>>>(leaves);
+	} else if (step == 3) {
+		advect_kernel3<<<blocks, threads>>>(leaves, minSizeSmall, minSize, thisMaxDensity, maxDensity, dt);
+	} else if (step == 4) {
+		advect_kernel4<<<blocks, threads>>>(leaves, totMass);
 	}
-	if (!forceFarOff && farCell) {
-		// std::cout << "far out dude\n";
-		func2(cell,flux-totFlux);
-	}
-
-	return flux;
+	cudaDeviceSynchronize();
 }
-
-
-class Simulator {
-    public:
-        Simulator(double width, double height, int startDepth, bool display=true, bool save=false, std::string fn=""): width(width), height(height), display(display), save(save), filename(fn) {
-            dt = 0.1;
-            // in meters per pixel
-            SCALE_H = height / consts::GRID_HEIGHT;
-            SCALE_W = width / consts::GRID_WIDTH;
-            cudaMallocManaged(&grid, sizeof(FluidGrid));
-            grid[0] = FluidGrid(width, height, startDepth, dt);
-            output.open(filename);
-            SDL_Init(SDL_INIT_VIDEO);       // Initializing SDL as Video
-            SDL_CreateWindowAndRenderer(consts::GRID_WIDTH, consts::GRID_HEIGHT, 0, &window, &renderer);
-            SDL_SetRenderDrawColor(renderer, 0, 0, 0, 0);      // setting draw color
-            SDL_RenderClear(renderer);
-
-        }
-
-        void drawCells() {
-            TreeLoc m;
-            uint32_t depth, index;
-            xyPos xyBL;
-            double cellWidth, cellHeight;
-            double thisMaxPressure = 0;
-            double thisMaxMass = 0;
-            double thisMinDensity = maxDensity;
-            double thisMaxDensity = 0;
-            double thisMaxTemperature = 0;
-            double thisMinTemperature = 0;
-            double thisMinGP = 0;
-            double thisMaxe = 0;
-            double thisMaxFusion = 0;
-	    double thisMaxPG = 0;
-            SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-            SDL_RenderClear(renderer);
-            std::vector<FluidCell *> leaves = grid->getLeafCells();
-            for (int i = 0; i < leaves.size(); i++) {
-
-                FluidCell *cell = leaves[i];
-                depth = cell->depth;
-                index = cell->index;
-                double pressure = cell->getPressure(false);
-                double density = cell->getDensity();
-                double temperature = cell->getTemp(false);
-                double gravPotential = cell->getGravPotential();
-                double e = cell->gete(false);
-                float X = std::max(0.0f,std::min(1.0f,cell->getX()));
-                float Y = std::max(0.0f,std::min(1.0f,cell->getY()));
-                float Z = std::max(0.0f,std::min(1.0f,cell->getZ()));
-                float fusion = cell->getFusionEnergy();
-                uint degenerate = cell->getDegenerate();
-                xyBL = grid->getXY(depth, index);
-                cellWidth = width / pow(pow(4,depth), 0.5);
-                cellHeight = height / pow(pow(4,depth), 0.5);
-
-                SDL_Rect rect{(int)(xyBL.x/SCALE_W), (int)(consts::GRID_HEIGHT - ((xyBL.y+cellHeight)/SCALE_H)), (int)(cellWidth/SCALE_W)+1, (int)(cellHeight/SCALE_H)+1};
-                if (density > thisMaxDensity) thisMaxDensity = density;
-                if (density < thisMinDensity) thisMinDensity = density;
-                if (pressure > thisMaxPressure) {
-                    thisMaxPressure = pressure;
-                }
-                if (temperature > thisMaxTemperature) {
-                    // && density > 0.01*maxDensity
-                    thisMaxTemperature = temperature;
-                }
-                if (gravPotential < thisMinGP) thisMinGP = gravPotential;
-                if (e > thisMaxe) thisMaxe = e;
-                if (fusion > thisMaxFusion) thisMaxFusion = fusion;
-				if (cell->PG > thisMaxPG) thisMaxPG = cell->PG;
-
-                double maxBit = 255.0;
-                double zero = 0;
-                if (pressureDisplay) {
-                    double scaledP_R = std::min(maxBit,255 * (pressure)/(maxPressure));
-                    if (scaledP_R < 0) scaledP_R = 0;
-
-                    SDL_SetRenderDrawColor(renderer, scaledP_R, 0, 255, 255);
-                } else if (densityDisplay) {
-                    double scaled_dens = std::sqrt(density/maxDensity) * 255;
-                    // scaled_dens = std::log10(cell->getMass())/std::log10(maxDensity*cell->getSize()) * 255;
-                    if (scaled_dens > 255) scaled_dens = 255;
-
-                    SDL_SetRenderDrawColor(renderer, scaled_dens*(1-Z), scaled_dens*std::max(0.0f,(1-Y-Z)), scaled_dens*Z, 255);
-                    // SDL_RenderFillRect(renderer, &rect);
-                } else if (temperatureDisplay) {
-                    double scaled_temp = std::min(maxBit,temperature/maxTemperature * 255);
-                    // if (density < 0.01*maxDensity) scaled_temp = 0;
-                    SDL_SetRenderDrawColor(renderer, 0, scaled_temp, 0, 255);
-                } else if (gravPotentialDisplay) {
-                    double scaled_pot = std::max(zero,std::min(maxBit,gravPotential/minGP * 255));
-                    // if (i == rows/2 && j == cols/2) printf("scaledGP:%f\n",gravPotential/minGP);
-                    SDL_SetRenderDrawColor(renderer, 255, scaled_pot, 0, 255);
-
-                } else if (energyDisplay) {
-                    double scaled_e = std::max(zero,std::min(maxBit,e/maxe * 255));
-                    SDL_SetRenderDrawColor(renderer, scaled_e, 0, 0, 255);
-                } else if (hydrogenDisplay) {
-                    int scaled_X = std::min(255.0f,X*255);
-                    // std::cout << X << std::endl;
-                    SDL_SetRenderDrawColor(renderer, scaled_X, scaled_X, 0, 255);
-                } else if (heliumDisplay) {
-                    int scaled_Y = std::min(255.0f,Y*255);
-                    SDL_SetRenderDrawColor(renderer, scaled_Y, 0, scaled_Y, 255);
-                } else if (ZDisplay) {
-                    int scaled_Z = std::min(255.0f,Z*255);
-                    SDL_SetRenderDrawColor(renderer, 0, 0, scaled_Z, 255);
-                } else if (fusionDisplay) {
-                    double scaled_fusion = std::max(zero,std::min(maxBit,fusion/maxFusion * 255));
-                    if (maxFusion == 0) scaled_fusion = 0;
-                    SDL_SetRenderDrawColor(renderer, 0, scaled_fusion, scaled_fusion, 255);
-                } else if (degenerateDisplay) {
-                    double deg = degenerate*255;
-		    deg = std::max(zero,std::min(maxBit,(double) cell->PG/maxPG * 255));
-                    SDL_SetRenderDrawColor(renderer, 0, 0, deg, 255);
-                }
-
-                SDL_RenderFillRect(renderer, &rect);
-                if (gridDisplay) {
-                    SDL_SetRenderDrawColor(renderer, 255,255,255, 255); // White outline
-                    SDL_RenderDrawRect(renderer, &rect);
-                }
-
-            }
-            if (velocityDisplay) {
-                for (int i = 0; i < leaves.size(); i++) {
-
-                    FluidCell *cell = leaves[i];
-                    depth = cell->depth;
-                    index = cell->index;
-                    xyBL = grid->getXY(depth, index);
-                    cellWidth = width / pow(pow(4,depth), 0.5);
-                    cellHeight = height / pow(pow(4,depth), 0.5);
-
-                    VelocityVector v = cell->getVelocity();
-                    Arrow arrow{(int)((xyBL.x+cellWidth/2)/SCALE_W), (int)(consts::GRID_HEIGHT - ((xyBL.y+cellHeight/2)/SCALE_H)), 2*(int)(v.getVx()*grid->getdt()/cellWidth * cellWidth/SCALE_W), -2*(int)(v.getVy()*grid->getdt()/cellHeight * cellHeight/SCALE_H)};
-                    SDL_SetRenderDrawColor(renderer, 255,255,255, 255);
-                    if (std::isfinite(v.getMag()) && v.getMag() > 0) drawArrow(renderer, arrow);
-
-                }
-            }
-
-			maxPG = thisMaxPG;
-            maxPressure = thisMaxPressure;
-            maxDensity = thisMaxDensity;
-            minDensity = thisMinDensity;
-            // maxDensity = 10;
-            maxMass = thisMaxMass;
-            maxTemperature = thisMaxTemperature;
-            minTemperature = thisMinTemperature;
-            // std::cout << maxTemperature << std::endl;
-            minGP = thisMinGP; // grav potential
-            maxe = thisMaxe;
-            maxFusion = thisMaxFusion;
-            SDL_RenderPresent(renderer);
-        }
-
-        void step(SDL_Event event) {
-            grid->update();
-            dt = grid->getdt();
-            t += grid->getdt();
-            if (event.key.type == SDL_KEYDOWN) {
-                switch (event.key.keysym.sym) {
-                    case SDLK_p:
-                        densityDisplay = 0;
-                        temperatureDisplay = 0;
-                        gravPotentialDisplay = 0;
-                        energyDisplay = 0;
-                        pressureDisplay = !(pressureDisplay);
-                        hydrogenDisplay = 0;
-                        heliumDisplay = 0;
-                        ZDisplay = 0;
-                        fusionDisplay = 0;
-                        degenerateDisplay = 0;
-                        break;
-                    case SDLK_d:
-                        pressureDisplay = 0;
-                        temperatureDisplay = 0;
-                        gravPotentialDisplay = 0;
-                        energyDisplay = 0;
-                        densityDisplay = !(densityDisplay);
-                        hydrogenDisplay = 0;
-                        heliumDisplay = 0;
-                        ZDisplay = 0;
-                        fusionDisplay = 0;
-                        degenerateDisplay = 0;
-                        std::cout << "max Density: " << maxDensity << " min Density: " << minDensity << std::endl;
-                        break;
-                    case SDLK_t:
-                        densityDisplay = 0;
-                        pressureDisplay = 0;
-                        gravPotentialDisplay = 0;
-                        energyDisplay = 0;
-                        temperatureDisplay = !(temperatureDisplay);
-                        hydrogenDisplay = 0;
-                        heliumDisplay = 0;
-                        ZDisplay = 0;
-                        fusionDisplay = 0;
-                        degenerateDisplay = 0;
-                        std::cout << "max Temperature: " << maxTemperature << std::endl;
-                        break;
-                    case SDLK_u:
-                        densityDisplay = 0;
-                        pressureDisplay = 0;
-                        temperatureDisplay = 0;
-                        energyDisplay = 0;
-                        gravPotentialDisplay = !(gravPotentialDisplay);
-                        hydrogenDisplay = 0;
-                        heliumDisplay = 0;
-                        ZDisplay = 0;
-                        fusionDisplay = 0;
-                        degenerateDisplay = 0;
-                        break;
-                    case SDLK_e:
-                        densityDisplay = 0;
-                        pressureDisplay = 0;
-                        temperatureDisplay = 0;
-                        gravPotentialDisplay = 0;
-                        energyDisplay = !(energyDisplay);
-                        hydrogenDisplay = 0;
-                        heliumDisplay = 0;
-                        ZDisplay = 0;
-                        fusionDisplay = 0;
-                        degenerateDisplay = 0;
-                        std::cout << "max internal energy: " << maxe << std::endl;
-                        break;
-                    case SDLK_7:
-                        densityDisplay = 0;
-                        pressureDisplay = 0;
-                        temperatureDisplay = 0;
-                        gravPotentialDisplay = 0;
-                        energyDisplay = 0;
-                        hydrogenDisplay = !(hydrogenDisplay);
-                        heliumDisplay = 0;
-                        ZDisplay = 0;
-                        fusionDisplay = 0;
-                        degenerateDisplay = 0;
-                        break;
-                    case SDLK_8:
-                        densityDisplay = 0;
-                        pressureDisplay = 0;
-                        temperatureDisplay = 0;
-                        gravPotentialDisplay = 0;
-                        energyDisplay = 0;
-                        hydrogenDisplay = 0;
-                        heliumDisplay = !(heliumDisplay);
-                        ZDisplay = 0;
-                        fusionDisplay = 0;
-                        degenerateDisplay = 0;
-                        break;
-                    case SDLK_9:
-                        densityDisplay = 0;
-                        pressureDisplay = 0;
-                        temperatureDisplay = 0;
-                        gravPotentialDisplay = 0;
-                        energyDisplay = 0;
-                        hydrogenDisplay = 0;
-                        heliumDisplay = 0;
-                        ZDisplay = !(ZDisplay);
-                        fusionDisplay = 0;
-                        degenerateDisplay = 0;
-                        break;
-                    case SDLK_f:
-                        densityDisplay = 0;
-                        pressureDisplay = 0;
-                        temperatureDisplay = 0;
-                        gravPotentialDisplay = 0;
-                        energyDisplay = 0;
-                        hydrogenDisplay = 0;
-                        heliumDisplay = 0;
-                        ZDisplay = 0;
-                        fusionDisplay = !(fusionDisplay);
-                        degenerateDisplay = 0;
-                        break;
-                    case SDLK_o:
-                        densityDisplay = 0;
-                        pressureDisplay = 0;
-                        temperatureDisplay = 0;
-                        gravPotentialDisplay = 0;
-                        energyDisplay = 0;
-                        hydrogenDisplay = 0;
-                        heliumDisplay = 0;
-                        ZDisplay = 0;
-                        fusionDisplay = 0;
-                        degenerateDisplay = !(degenerateDisplay);
-                        break;
-                    case SDLK_g:
-                        gridDisplay = !(gridDisplay);
-                        break;
-                    case SDLK_v:
-                        velocityDisplay = !(velocityDisplay);
-                        break;
-                    case SDLK_m:
-                        mouseValueDisplay = !(mouseValueDisplay);
-                }
-            }
-            if (display) {
-                drawCells();
-            }
-
-            if (save) {
-                saveSim();
-            }
-            // SDL_Delay(grid->getdt()*1000);  // setting some Delay
-            SDL_Delay(16);
-        }
-
-        void saveSim() {
-            for (auto &pair : grid->getIDMap()) {
-                uint64_t ID = pair.first;
-                FluidCell *cell = pair.second;
-                long double mass = cell->getMass();
-                long double pressure = cell->getPressure(false);
-                long double density = cell->getDensity();
-                long double temperature = cell->getTemp(false);
-                long double gravPotential = cell->getGravPotential();
-                long double e = cell->gete(false);
-                long double fusion = cell->getFusionEnergy();
-                output << "//" << ID << ":" << density << "," << cell->getX() << "," << cell->getY() << "," << cell->getZ() << "," << temperature << "," << pressure << "," << e << "," << gravPotential << "," << fusion;
-            }
-            output << "\nt:" << t;
-            output << "\n";
-        }
-
-        void freeSim() {
-            grid->freeGrid();
-            free(grid);
-            output.close();
-        }
-
-        double getT() {
-            // time passed
-            return t;
-        }
-
-        FluidGrid *grid = nullptr;
-    private:
-        // in meters per pixel
-        double SCALE_H, SCALE_W;
-        double width, height;
-        bool display, save;
-        double dt;
-        SDL_Renderer *renderer = NULL;
-        SDL_Window *window = NULL;
-        SDL_Surface *screenSurface;
-        std::ofstream output = std::ofstream();
-        std::string filename = "";
-        double t = 0;
-        double maxMass = 255;
-        double maxPressure = 1;
-        double maxDensity = 1;
-        double minDensity = 1e10;
-        double maxTemperature = 1;
-        double minTemperature = 0;
-        double minGP = 0;
-        double maxe = 0;
-        double maxFusion = 0;
-	    double maxPG = 0;
-        uint pressureDisplay = 0;
-        uint temperatureDisplay = 0;
-        uint densityDisplay = 1;
-        uint gravPotentialDisplay = 0;
-        uint energyDisplay = 0;
-        uint heliumDisplay = 0;
-        uint hydrogenDisplay = 0;
-        uint ZDisplay = 0;
-        uint fusionDisplay = 0;
-        uint degenerateDisplay = 0;
-        uint gridDisplay = 0;
-        uint velocityDisplay = 0;
-        uint mouseValueDisplay = 0;
-};
 

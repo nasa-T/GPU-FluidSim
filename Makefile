@@ -2,9 +2,9 @@ all: fluid
 #display
 
 fluid: fluid.cpp fluid.h
-	nvcc -c fluid.cu -o kernel_file.o
-	g++ 
-	g++ -std=c++17 -O3 -lSDL2 -o fluid fluid.cpp
+	nvcc -c fluid.cu -o kernel.o
+	g++ -std=c++17 -O3 -lSDL2 -o fluid.o fluid.cpp
+	g++ kernel.o fluid.o -o main
 	#g++ -std=c++17 -O3 -fopenmp -I/usr/local/include -L/usr/local/lib -lSDL2 -o fluid fluid.cpp
 #-lSDL2_ttf -lomp
 	# g++ -std=c++17 -o fluid fluid.cpp -lSDL2
