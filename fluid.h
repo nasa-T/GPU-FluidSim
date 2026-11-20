@@ -7,6 +7,14 @@
 #include <vector>
 #include <map>
 
+#if defined(__CUDACC__)
+    // If compiled with NVCC, keep the CUDA specifiers
+    #define CUDA_HOST_DEVICE __host__ __device__
+#else
+    // If compiled with g++, clang, or MSVC, erase them
+    #define CUDA_HOST_DEVICE
+#endif
+
 namespace consts {
     const double HMol = 1.008e-3;
     const double HeMol = 4.003e-3;
@@ -252,7 +260,7 @@ class FluidGrid;
 class Star;
 class Simulator;
 
-void launch_advect_kernel(int blocks, int threads, std::vector<FluidCell*> leaves, int step, bool& minSizeSmall, double minSize, float maxFracTraveled, long double& thisMaxDensity, long double& maxDensity, long double& totMass, double& maxV, float dt);  
+extern "C" void launch_advect_kernel(int blocks, int threads, std::vector<FluidCell*> leaves, int step, bool& minSizeSmall, double minSize, float maxFracTraveled, long double& thisMaxDensity, long double& maxDensity, long double& totMass, double& maxV, float dt);  
 
 
 

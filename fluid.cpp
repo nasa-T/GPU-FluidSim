@@ -3,10 +3,12 @@
 #include <sstream>
 #include <iomanip>
 #include <fstream>
-//#include "fluid.h"
+#include "fluid.h"
+//#include "fluid.cu"
 
 #include <map>
 #include <string>
+#include <vector>
 //#include <functional>
 
 #include <omp.h>
@@ -16,36 +18,39 @@
 #include <cassert>
 
 #include <cuda_runtime.h>
+#include <cuda.h>
+
+extern "C" void launch_advect_kernel(int blocks, int threads, std::vector<FluidCell*> leaves, int step, bool& minSizeSmall, double minSize, float maxFracTraveled, long double& thisMaxDensity, long double& maxDensity, long double& totMass, double& maxV, float dt);
 
 class VelocityVector {
     public:
-        VelocityVector(double vx_ = 0, double vy_ = 0, double ax_ = 0, double ay_ = 0): vx(vx_), vy(vy_), ax(ax_), ay(ay_) {}
-        VelocityVector operator+(VelocityVector& other) {
+        CUDA_HOST_DEVICE VelocityVector(double vx_ = 0, double vy_ = 0, double ax_ = 0, double ay_ = 0): vx(vx_), vy(vy_), ax(ax_), ay(ay_) {}
+        CUDA_HOST_DEVICE VelocityVector operator+(VelocityVector& other) {
             VelocityVector added(this->vx + other.vx, this->vy + other.vy, other.ax, other.ay);
             return added;
         }
-        VelocityVector operator/(double d) {
+        CUDA_HOST_DEVICE VelocityVector operator/(double d) {
             VelocityVector divided(this->vx/d, this->vy/d, ax, ay);
             return divided;
         }
-        VelocityVector operator-(VelocityVector& other) {
+        CUDA_HOST_DEVICE VelocityVector operator-(VelocityVector& other) {
             VelocityVector subtracted(this->vx - other.vx, this->vy - other.vy, other.ax, other.ay);
             return subtracted;
         }
-        VelocityVector operator*(double d) {
+        CUDA_HOST_DEVICE VelocityVector operator*(double d) {
             VelocityVector divided(this->vx*d, this->vy*d, ax, ay);
             return divided;
         }
-        double getVx() {
+        CUDA_HOST_DEVICE double getVx() {
             return vx;
         }
-        double getVy() {
+        CUDA_HOST_DEVICE double getVy() {
             return vy;
         }
-        double getAx() {
+        CUDA_HOST_DEVICE double getAx() {
             return ax;
         }
-        double getAy() {
+        CUDA_HOST_DEVICE double getAy() {
             return ay;
         }
         void setVx(double v) {
@@ -58,7 +63,7 @@ class VelocityVector {
             vx += ax * consts::dt;
             vy += ay * consts::dt;
         }
-        double getMag() {
+        CUDA_HOST_DEVICE double getMag() {
             return std::sqrt(getVx()*getVx()+getVy()*getVy());
             // return pow(vx*vx+vy*vy,1/2);
         }
@@ -104,29 +109,29 @@ class FluidCell {
             return consts::r/(consts::HMol*hydrogen/nonMet+consts::HeMol*helium/nonMet)/(1.4-1);
         }
 
-        long double getMass() {
+        CUDA_HOST_DEVICE long double getMass() {
 	    absorbChildProps();
             return mass;
         }
 
-        long double getSize() {
+        CUDA_HOST_DEVICE long double getSize() {
             return size;
         }
 
-        long double getWidth() {
+        CUDA_HOST_DEVICE long double getWidth() {
             return width;
         }
 
-        long double getHeight() {
+        CUDA_HOST_DEVICE long double getHeight() {
             return height;
         }
 
-        long double getDensity() {
+        CUDA_HOST_DEVICE long double getDensity() {
 	    absorbChildProps();
             return mass/size;
         }
 
-        long double getTemp(bool recalculate=true) {
+        CUDA_HOST_DEVICE long double getTemp(bool recalculate=true) {
             if (recalculate) {
                 // double cv = consts::r/consts::HMol/(1.4-1);
                 if (mass == 0) {
@@ -143,7 +148,7 @@ class FluidCell {
             temperature = t;
         }
 
-        double getPressure(bool recalculate=true) {
+        CUDA_HOST_DEVICE double getPressure(bool recalculate=true) {
             // double oldPressure = pressure;
             if (recalculate) {
                 // pressure = getDensity()/consts::HMol * consts::r * getTemp();
@@ -161,11 +166,11 @@ class FluidCell {
             return pressure;
         }
 
-        void setPressure(double p) {
+        CUDA_HOST_DEVICE void setPressure(double p) {
             pressure = p;
         }
 
-        void setMass(long double m) {
+        CUDA_HOST_DEVICE void setMass(long double m) {
             if (m > 1e-8*getSize() && std::isfinite(m)) {
                 mass = m;
             } else {
@@ -181,12 +186,12 @@ class FluidCell {
             setMass(mass + m);
         }
 
-        float getX() {
+        CUDA_HOST_DEVICE float getX() {
             // hydrogen = hydrogen/(hydrogen+helium+metals);
             return hydrogen;
         }
 
-        void setX(float h) {
+        CUDA_HOST_DEVICE void setX(float h) {
             if (h < 0) hydrogen = 0;
             else if (h > 1)	hydrogen = 1;
             else hydrogen = h;
@@ -200,12 +205,12 @@ class FluidCell {
 
         }
 
-        float getY() {
+        CUDA_HOST_DEVICE float getY() {
             // helium = helium/(hydrogen+helium+metals);
             return helium;
         }
 
-        void setY(float he) {
+        CUDA_HOST_DEVICE void setY(float he) {
             if (he < 0) helium = 0;
             else if (he > 1) helium = 1;
             else helium = he;
@@ -217,13 +222,13 @@ class FluidCell {
             // }
         }
 
-        float getZ() {
+        CUDA_HOST_DEVICE float getZ() {
             // metals = 1 - hydrogen - helium;
             // metals = metals/(hydrogen+helium+metals);
             return metals;
         }
 
-        void setZ(float Z) {
+        CUDA_HOST_DEVICE void setZ(float Z) {
             if (Z < 0) metals = 0;
             else if (Z > 1) metals = 1;
             else metals = Z;
@@ -260,7 +265,7 @@ class FluidCell {
             return e;
         }
 	
-        void sete(long double energy) {
+        CUDA_HOST_DEVICE void sete(long double energy) {
             if (mass > 0 && energy > 0) {
                 e = energy;
             } else {
@@ -270,14 +275,14 @@ class FluidCell {
             }
         }
         
-        long double getE(bool recalculate=false) {
+        CUDA_HOST_DEVICE long double getE(bool recalculate=false) {
             // if (recalculate) {
             //     E = e + 1/2*getDensity()*velocity.getMag()*velocity.getMag();
             // }
             return E;
         }
 
-        void setE(long double energy) {
+        CUDA_HOST_DEVICE void setE(long double energy) {
             if (mass > 0 && energy > 0) {
                 E = energy;
             } else {
@@ -311,16 +316,16 @@ class FluidCell {
             gravPotential = u;
         }
 
-        FluidCell *getRight() {
+        CUDA_HOST_DEVICE FluidCell *getRight() {
             return neighbors.right;
         }
-        FluidCell *getLeft() {
+        CUDA_HOST_DEVICE FluidCell *getLeft() {
             return neighbors.left;
         }
-        FluidCell *getTop() {
+        CUDA_HOST_DEVICE FluidCell *getTop() {
             return neighbors.top;
         }
-        FluidCell *getBottom() {
+        CUDA_HOST_DEVICE FluidCell *getBottom() {
             return neighbors.bottom;
         }
 
@@ -363,14 +368,14 @@ class FluidCell {
             velocity.setVy(vy);
         }
 
-        void setVelocity(VelocityVector v) {
+        CUDA_HOST_DEVICE void setVelocity(VelocityVector v) {
 			if (v.getMag() == 0.0) {
 				//std::cout << "zero vel dens: " << getDensity() << std::endl;
 			}
             velocity = v;
         }
 
-        VelocityVector getVelocity() {
+        CUDA_HOST_DEVICE VelocityVector getVelocity() {
             // return VelocityVector(0,1);
             return velocity;
         }
@@ -406,7 +411,7 @@ class FluidCell {
         //     return children;
         // }
 
-        bool hasChildren() {
+        CUDA_HOST_DEVICE bool hasChildren() {
             return ((nw != nullptr) || (ne != nullptr) || (sw != nullptr) || (se != nullptr));
         }
 

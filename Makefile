@@ -1,10 +1,11 @@
 all: fluid
 #display
 
-fluid: fluid.cpp fluid.h
-	nvcc -c fluid.cu -o kernel.o
-	g++ -std=c++17 -O3 -lSDL2 -o fluid.o fluid.cpp
-	g++ kernel.o fluid.o -o main
+fluid: fluid.cu fluid.cpp fluid.h
+	nvcc --expt-relaxed-constexpr -c fluid.cu -o kernel.o -lcudart -lcuda -lcublas
+	#g++ -std=c++17 -O3 -lSDL2 -o fluid.o fluid.cpp
+	nvcc -std=c++17 -O3 -x cu -o fluid.o fluid.cpp -lSDL2 -lcudart -lcuda -lcublas
+	nvcc -std=c++17 kernel.o fluid.o -o main -lSDL2 -lcudart -lcuda -lcublas
 	#g++ -std=c++17 -O3 -fopenmp -I/usr/local/include -L/usr/local/lib -lSDL2 -o fluid fluid.cpp
 #-lSDL2_ttf -lomp
 	# g++ -std=c++17 -o fluid fluid.cpp -lSDL2
